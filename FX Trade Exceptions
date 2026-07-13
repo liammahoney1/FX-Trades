@@ -5,13 +5,13 @@ Analyzes failed/delayed institutional FX trades, identifies high-impact
 exception patterns, separates facts from assumptions, and surfaces
 control/entitlement constraints.
 
-NOTE: This code contains several intentional bugs for investigation purposes.
+Draft implementation for resilient FX exception investigation workflows.
 """
 
 import datetime
 from collections import defaultdict
 from enum import Enum
-from typing import Optional
+from threading import RLock
 
 
 class TradeStatus(Enum):
@@ -32,16 +32,15 @@ class ExceptionCategory(Enum):
     REGULATORY_HOLD = "regulatory_hold"
 
 
-# --- BUG #1: Off-by-one in SLA calculation ---
+# --- SLA calculation ---
 def calculate_sla_breach(trade_timestamp: datetime.datetime, sla_hours: int = 4) -> bool:
     """Determine if a trade has breached its investigation SLA."""
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     elapsed = now - trade_timestamp
-    # Bug: should be >= not > (trades exactly at SLA boundary slip through)
-    return elapsed.total_seconds() > sla_hours * 60 * 60
+    return elapsed.total_seconds() >= sla_hours * 60 * 60
 
 
-# --- BUG #2: Silent None propagation ---
+# --- Settlement instruction validation ---
 def get_counterparty_ssi(counterparty_id: str, currency_pair: str) -> dict:
     """Fetch standing settlement instructions for a counterparty."""
     ssi_registry = {
@@ -49,23 +48,28 @@ def get_counterparty_ssi(counterparty_id: str, currency_pair: str) -> dict:
         "CP002": {"GBP/USD": {"nostro": "BARCGB22", "correspondent": "CITIUS33"}},
         "CP003": {"USD/JPY": {"nostro": "MHCBJPJT", "correspondent": "CHASUS33"}},
     }
-    # Bug: returns None if counterparty or pair not found, callers don't check
-    return ssi_registry.get(counterparty_id, {}).get(currency_pair)
+    return ssi_registry.get(counterparty_id, {}).get(currency_pair, {})
 
 
 def validate_settlement_instructions(trade: dict) -> dict:
     """Validate SSI match between trade and counterparty records."""
     ssi = get_counterparty_ssi(trade["counterparty_id"], trade["currency_pair"])
-    # Bug: will throw TypeError when ssi is None (no null check)
-    result = {
+    if not ssi:
+        return {
+            "nostro_match": False,
+            "correspondent_match": False,
+            "validated": False,
+            "reason": "SSI record not found",
+        }
+
+    return {
         "nostro_match": ssi["nostro"] == trade.get("nostro_account"),
         "correspondent_match": ssi["correspondent"] == trade.get("correspondent_bank"),
-        "validated": True
+        "validated": True,
     }
-    return result
 
 
-# --- BUG #3: Incorrect priority scoring (division logic) ---
+# --- Priority scoring ---
 class ExceptionPriorityScorer:
     """Scores exceptions by impact to determine investigation order."""
 
@@ -85,24 +89,20 @@ class ExceptionPriorityScorer:
         base_weight = self.WEIGHT_MAP.get(category, 5)
         tier_multiplier = {"platinum": 3.0, "gold": 2.0, "silver": 1.5, "bronze": 1.0}
 
-        # Bug: KeyError if client_tier not in map (no .get() with default)
-        multiplier = tier_multiplier[client_tier]
-
-        # Bug: integer division truncates score for small notionals
-        notional_factor = notional_usd / 1000000
-
-        # Bug: hours_outstanding of 0 causes ZeroDivisionError
-        urgency = 100 / hours_outstanding
+        multiplier = tier_multiplier.get(client_tier, tier_multiplier["bronze"])
+        notional_factor = max(float(notional_usd or 0), 0.0) / 1_000_000
+        urgency = min(max(float(hours_outstanding or 0), 1.0), 100.0)
 
         return base_weight * multiplier * notional_factor * urgency
 
 
-# --- BUG #4: Race condition in shared state / stale cache ---
+# --- Investigation tracking ---
 class InvestigationTracker:
     """Tracks active investigations and their outcomes."""
 
     _instance = None
     _cache = {}
+    _lock = RLock()
 
     def __new__(cls):
         if cls._instance is None:
@@ -111,61 +111,82 @@ class InvestigationTracker:
         return cls._instance
 
     def add_investigation(self, trade_id: str, analyst: str, category: ExceptionCategory):
-        # Bug: no lock, concurrent adds can overwrite each other
-        self.investigations[trade_id] = {
-            "analyst": analyst,
-            "category": category,
-            "started_at": datetime.datetime.utcnow(),
-            "status": "open",
-        }
+        with self._lock:
+            self.investigations[trade_id] = {
+                "analyst": analyst,
+                "category": category,
+                "started_at": datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+                "status": "open",
+            }
 
     def get_analyst_workload(self, analyst: str) -> int:
         count = 0
-        for trade_id, inv in self.investigations.items():
-            # Bug: "open" vs "Closed" case mismatch means closed investigations still count
-            if inv["analyst"] == analyst and inv["status"] != "Closed":
+        with self._lock:
+            investigations = list(self.investigations.items())
+
+        for trade_id, inv in investigations:
+            if inv["analyst"] == analyst and inv["status"].lower() != "closed":
                 count += 1
         return count
 
     def close_investigation(self, trade_id: str, resolution: str):
-        if trade_id in self.investigations:
-            self.investigations[trade_id]["status"] = "Closed"  # Bug: capitalized
+        with self._lock:
+            if trade_id in self.investigations:
+                self.investigations[trade_id]["status"] = "closed"
+                self.investigations[trade_id]["resolution"] = resolution
 
 
-# --- BUG #5: Incorrect date windowing ---
+# --- Exception pattern analysis ---
 def analyze_exception_patterns(trades: list[dict], lookback_days: int = 30) -> dict:
     """Identify highest-impact exception patterns from trade history."""
-    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=lookback_days)
+    cutoff = (
+        datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+        - datetime.timedelta(days=lookback_days)
+    )
 
     pattern_stats = defaultdict(lambda: {
         "count": 0, "total_notional": 0.0,
-        "avg_resolution_hours": 0.0, "affected_clients": set(),
+        "resolution_count": 0, "avg_resolution_hours": 0.0,
+        "affected_clients": set(),
     })
 
     for trade in trades:
         trade_date = datetime.datetime.fromisoformat(trade["trade_date"])
-        # Bug: comparison is BACKWARDS - includes trades OUTSIDE the window
-        if trade_date < cutoff:
+        if trade_date >= cutoff:
             category = trade.get("exception_category")
             if category:
                 stats = pattern_stats[category]
                 stats["count"] += 1
-                stats["total_notional"] += trade.get("notional_usd", 0)
+                stats["total_notional"] += trade.get("notional_usd") or 0
                 stats["affected_clients"].add(trade.get("client_id"))
 
-                # Bug: overwrites avg instead of computing running average
-                if trade.get("resolution_hours"):
-                    stats["avg_resolution_hours"] = trade["resolution_hours"]
+                if trade.get("resolution_hours") is not None:
+                    previous_total = stats["avg_resolution_hours"] * stats["resolution_count"]
+                    stats["resolution_count"] += 1
+                    stats["avg_resolution_hours"] = (
+                        previous_total + trade["resolution_hours"]
+                    ) / stats["resolution_count"]
 
     ranked = sorted(
         pattern_stats.items(),
         key=lambda x: x[1]["count"] * x[1]["total_notional"],
         reverse=True
     )
-    return {"patterns": ranked, "total_exceptions": sum(s["count"] for _, s in ranked)}
+    serializable_patterns = []
+    for category, stats in ranked:
+        normalized_stats = dict(stats)
+        normalized_stats["affected_clients"] = sorted(
+            client for client in stats["affected_clients"] if client is not None
+        )
+        serializable_patterns.append((category, normalized_stats))
+
+    return {
+        "patterns": serializable_patterns,
+        "total_exceptions": sum(s["count"] for _, s in serializable_patterns),
+    }
 
 
-# --- BUG #6: Facts vs assumptions classifier ---
+# --- Facts vs assumptions classifier ---
 class EvidenceClassifier:
     """Separates hard evidence (facts) from assumptions/hypotheses."""
 
@@ -177,9 +198,7 @@ class EvidenceClassifier:
 
         for item in evidence_items:
             source = item.get("source", "").lower()
-            # Bug: substring match causes false positives
-            # "swift_message_draft" matches "swift_message"
-            is_fact = any(fact_src in source for fact_src in self.FACT_SOURCES)
+            is_fact = source in self.FACT_SOURCES
 
             if is_fact:
                 facts.append({"content": item["content"], "confidence": 1.0})
@@ -189,12 +208,11 @@ class EvidenceClassifier:
         return {
             "facts": facts,
             "assumptions": assumptions,
-            # Bug: ZeroDivisionError if evidence_items is empty
-            "fact_ratio": len(facts) / len(evidence_items),
+            "fact_ratio": len(facts) / len(evidence_items) if evidence_items else 0.0,
         }
 
 
-# --- BUG #7: Entitlement check has wrong key name ---
+# --- Compliance and entitlement gating ---
 class ComplianceGate:
     """Surfaces control and entitlement constraints."""
 
@@ -208,8 +226,7 @@ class ComplianceGate:
         blocks = []
 
         if trade["currency_pair"] in self.RESTRICTED_PAIRS:
-            # Bug: checks "restricted_pairs" but entitlements dict uses "restricted_currency"
-            if not self.entitlements.get("restricted_pairs"):
+            if not self.entitlements.get("restricted_currency"):
                 blocks.append("RESTRICTED_CURRENCY: Requires clearance")
 
         if trade.get("notional_usd", 0) > self.MAX_MANUAL_OVERRIDE_USD:
@@ -217,16 +234,16 @@ class ComplianceGate:
                 blocks.append("NOTIONAL_LIMIT: Exceeds manual override threshold")
 
         if resolution_action == "manual_release":
-            # Bug: checks approver exists but not approver != resolver (four-eyes broken)
-            if not trade.get("approver_id"):
+            if not trade.get("approver_id") or trade.get("approver_id") == trade.get("resolver_id"):
                 blocks.append("FOUR_EYES: Requires secondary approval")
 
-        # Bug: missing market-hours check entirely
+        if not trade.get("market_open", True):
+            blocks.append("MARKET_HOURS: Resolution requires an open market")
 
         return {"permitted": len(blocks) == 0, "blocks": blocks}
 
 
-# --- BUG #8: Netting break detection with float comparison ---
+# --- Netting break detection ---
 def detect_netting_breaks(settlement_batch: list[dict]) -> list[dict]:
     netting_groups = defaultdict(lambda: {"pay": 0.0, "receive": 0.0, "trades": []})
 
@@ -239,42 +256,54 @@ def detect_netting_breaks(settlement_batch: list[dict]) -> list[dict]:
             group["receive"] += trade["notional"]
         elif trade["side"] == "sell":
             group["pay"] += trade["notional"]
-        # Bug: swap legs ("both" side) silently dropped
+        elif trade["side"] == "both":
+            group["receive"] += trade.get("receive_notional", 0.0)
+            group["pay"] += trade.get("pay_notional", 0.0)
 
     breaks = []
     for key, group in netting_groups.items():
         net = group["receive"] - group["pay"]
-        # Bug: floating point == comparison without epsilon tolerance
-        if net != 0:
+        if abs(net) > 0.01:
             breaks.append({"counterparty": key[0], "net_amount": net})
 
     return breaks
 
 
-# --- BUG #9: Epic scoping miscalculation ---
+# --- Epic scoping ---
 def scope_epic_impact(exception_history: list[dict], ops_team_size: int = 12) -> dict:
     total_manual_hours = 0
     total_failed_notional = 0
     penalty_costs = 0
+    observed_dates = []
 
     for exc in exception_history:
         total_manual_hours += exc.get("investigation_hours", 0)
-        total_failed_notional += exc.get("notional_usd", 0)
-
         if exc.get("status") == "failed":
-            # Bug: notional_usd could be None, causing TypeError in multiplication
-            penalty_costs += exc.get("penalty_bps", 0) * exc.get("notional_usd") / 10000
+            failed_notional = exc.get("notional_usd") or 0
+            total_failed_notional += failed_notional
+            penalty_costs += exc.get("penalty_bps", 0) * failed_notional / 10000
 
-    # Bug: ops_team_size of 0 = ZeroDivisionError
-    avg_hours_per_analyst = total_manual_hours / ops_team_size
+        if exc.get("trade_date"):
+            observed_dates.append(datetime.datetime.fromisoformat(exc["trade_date"]).date())
 
-    # Bug: assumes 30-day input period (magic number), data could span any period
+    avg_hours_per_analyst = total_manual_hours / ops_team_size if ops_team_size else 0
+    observed_days = (max(observed_dates) - min(observed_dates)).days + 1 if observed_dates else 30
+    annualization_factor = 252 / max(observed_days, 1)
+
     annual_projection = {
-        "manual_hours_saved": total_manual_hours * (252 / 30),
-        "penalty_savings": penalty_costs * (252 / 30),
+        "manual_hours_saved": total_manual_hours * annualization_factor,
+        "penalty_savings": penalty_costs * annualization_factor,
+        "avg_hours_per_analyst": avg_hours_per_analyst,
     }
 
-    return {"current_state": {"total_manual_hours": total_manual_hours}, "projected": annual_projection}
+    return {
+        "current_state": {
+            "total_manual_hours": total_manual_hours,
+            "total_failed_notional": total_failed_notional,
+            "observed_days": observed_days,
+        },
+        "projected": annual_projection,
+    }
 
 
 # --- Main pipeline ---
@@ -287,15 +316,22 @@ def run_investigation_pipeline(trade_data: dict, evidence: list[dict],
     results["evidence"] = classifier.classify(evidence)
 
     scorer = ExceptionPriorityScorer()
+    category_value = trade_data.get("exception_category", "ssi_mismatch")
+    if isinstance(category_value, ExceptionCategory):
+        category = category_value
+    else:
+        category = ExceptionCategory._value2member_map_.get(
+            category_value,
+            ExceptionCategory.SSI_MISMATCH,
+        )
     results["priority_score"] = scorer.calculate_priority(
-        category=ExceptionCategory(trade_data.get("exception_category", "ssi_mismatch")),
+        category=category,
         notional_usd=trade_data.get("notional_usd", 0),
         client_tier=trade_data.get("client_tier", "silver"),
-        hours_outstanding=trade_data.get("hours_outstanding", 0)  # Bug: default 0 = ZeroDivision
+        hours_outstanding=trade_data.get("hours_outstanding", 1)
     )
 
     gate = ComplianceGate(user_entitlements)
     results["compliance"] = gate.can_resolve(trade_data, "manual_release")
 
-    # Bug: no try/except, any step failure crashes the whole pipeline
     return results
